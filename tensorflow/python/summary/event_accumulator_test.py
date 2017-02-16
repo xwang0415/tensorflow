@@ -19,6 +19,7 @@ from __future__ import print_function
 
 import os
 
+import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 from tensorflow.core.framework import graph_pb2
@@ -64,6 +65,18 @@ class _EventGenerator(object):
         summary=summary_pb2.Summary(
             value=[summary_pb2.Summary.Value(
                 tag=tag, simple_value=value)]))
+    self.AddEvent(event)
+
+  def AddHealthPill(self, wall_time, step, node_name, output_slot, elements):
+    event = event_pb2.Event()
+    event.wall_time = wall_time
+    event.step = step
+    value = event.summary.value.add()
+    # The node_name property is actually a watch key.
+    value.node_name = '%s:%d:DebugNumericSummary' % (node_name, output_slot)
+    value.tag = '__health_pill__'
+    value.tensor.tensor_shape.dim.add().size = len(elements)
+    value.tensor.tensor_content = np.array(elements, dtype=np.float64).tobytes()
     self.AddEvent(event)
 
   def AddHistogram(self,
@@ -251,6 +264,50 @@ class MockingEventAccumulatorTest(EventAccumulatorTest):
     self.assertEqual(acc.Scalars('s1'), [s1])
     self.assertEqual(acc.Scalars('s2'), [s2])
 
+  def _compareHealthPills(self, expected_event, gotten_event):
+    """Compares 2 health pills.
+
+    Args:
+      expected_event: The expected HealthPillEvent.
+      gotten_event: The gotten HealthPillEvent.
+    """
+    self.assertEqual(expected_event.wall_time, gotten_event.wall_time)
+    self.assertEqual(expected_event.step, gotten_event.step)
+    self.assertEqual(expected_event.node_name, gotten_event.node_name)
+    self.assertEqual(expected_event.output_slot, gotten_event.output_slot)
+    self.assertEqual(len(expected_event.value), len(gotten_event.value))
+    for i, expected_value in enumerate(expected_event.value):
+      self.assertEqual(expected_value, gotten_event.value[i])
+
+  def testHealthPills(self):
+    gen = _EventGenerator()
+    acc = ea.EventAccumulator(gen)
+    gen.AddHealthPill(13371337, 41, 'Add', 0, range(1, 13))
+    gen.AddHealthPill(13381338, 42, 'Add', 1, range(42, 54))
+
+    acc = ea.EventAccumulator(gen)
+    acc.Reload()
+
+    # Retrieve the health pills for each node name.
+    gotten_events = acc.HealthPills('Add')
+    self.assertEquals(2, len(gotten_events))
+    self._compareHealthPills(
+        ea.HealthPillEvent(
+            wall_time=13371337,
+            step=41,
+            node_name='Add',
+            output_slot=0,
+            value=range(1, 13)),
+        gotten_events[0])
+    self._compareHealthPills(
+        ea.HealthPillEvent(
+            wall_time=13381338,
+            step=42,
+            node_name='Add',
+            output_slot=1,
+            value=range(42, 54)),
+        gotten_events[1])
+
   def testHistograms(self):
     gen = _EventGenerator()
     acc = ea.EventAccumulator(gen)
@@ -350,6 +407,32 @@ class MockingEventAccumulatorTest(EventAccumulatorTest):
     expected_cmphst2 = ea.CompressedHistogramEvent(
         wall_time=2, step=12, compressed_histogram_values=expected_vals2)
     self.assertEqual(acc.CompressedHistograms('hst2'), [expected_cmphst2])
+
+  def testCompressedHistogramsWithEmptyHistogram(self):
+    gen = _EventGenerator()
+    acc = ea.EventAccumulator(gen, compression_bps=(0, 2500, 5000, 7500, 10000))
+
+    gen.AddHistogram(
+        'hst1',
+        wall_time=1,
+        step=10,
+        hmin=None,
+        hmax=None,
+        hnum=0,
+        hsum=0,
+        hsum_squares=0,
+        hbucket_limit=[1, 2, 3],
+        hbucket=[0, 0, 0])
+    acc.Reload()
+
+    # Create the expected values after compressing hst1
+    expected_vals1 = [
+        ea.CompressedHistogramValue(bp, val)
+        for bp, val in [(0, 0.0), (2500, 0), (5000, 0), (7500, 0), (10000, 0)]
+    ]
+    expected_cmphst1 = ea.CompressedHistogramEvent(
+        wall_time=1, step=10, compressed_histogram_values=expected_vals1)
+    self.assertEqual(acc.CompressedHistograms('hst1'), [expected_cmphst1])
 
   def testCompressHistogram_uglyHistogram(self):
     bps = (0, 668, 1587, 3085, 5000, 6915, 8413, 9332, 10000)

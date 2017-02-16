@@ -20,7 +20,7 @@ from __future__ import print_function
 
 import contextlib
 import math
-import os.path
+import os
 import random
 import shutil
 import tempfile
@@ -66,18 +66,6 @@ from tensorflow.python.training import gradient_descent
 from tensorflow.python.training import queue_runner_impl
 from tensorflow.python.training import saver as saver_module
 from tensorflow.python.util import compat
-
-
-# pylint: disable=invalid-name
-def _TestDir(test_name):
-  test_dir = os.path.join(test.get_temp_dir(), test_name)
-  if os.path.exists(test_dir):
-    shutil.rmtree(test_dir)
-  gfile.MakeDirs(test_dir)
-  return test_dir
-
-
-# pylint: enable=invalid-name
 
 
 class CheckpointedOp(object):
@@ -556,15 +544,45 @@ class SaverTest(test.TestCase):
       self.assertEqual(10.0, v0.eval())
       self.assertEqual(20.0, v1.eval())
 
+      error_msg_template = "Parent directory of {} doesn't exist, can't save."
+
       # Assert saving fails when parent dir of save path doesn't exist
       with self.assertRaisesWithPredicateMatch(
           ValueError,
-          lambda e: "Parent directory of {} doesn't exist, can't save.".format(save_path) in str(e)
+          lambda e: error_msg_template.format(save_path) in str(e)
       ):
         save.save(sess, save_path)
 
+  def testSaveToURI(self):
+    # ParseURI functions don't work on Windows yet.
+    # TODO(jhseu): Remove this check when it works.
+    if os.name == "nt":
+      self.skipTest("Local URI support doesn't work on Windows")
+    save_path = "file://" + os.path.join(self.get_temp_dir(), "uri")
+
+    # Build a graph with 2 parameter nodes, and Save and
+    # Restore nodes for them.
+    v0 = variables.Variable(10.0, name="v0")
+    v1 = variables.Variable(20.0, name="v1")
+    save = saver_module.Saver({"v0": v0, "v1": v1}, restore_sequentially=True)
+    init_all_op = variables.global_variables_initializer()
+
+    with self.test_session() as sess:
+      # Initialize all variables
+      sess.run(init_all_op)
+
+      # Check that the parameter nodes have been initialized.
+      self.assertEqual(10.0, v0.eval())
+      self.assertEqual(20.0, v1.eval())
+      save.save(sess, save_path)
+
 
 class SaveRestoreShardedTest(test.TestCase):
+
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
 
   def testBasics(self):
     save_path = os.path.join(self.get_temp_dir(), "sharded_basics")
@@ -690,11 +708,13 @@ class SaveRestoreShardedTest(test.TestCase):
       sd = save.as_saver_def()
       self.assertTrue(sd.sharded)
 
-  def testPartitionedVariables(self):
+  def _testPartitionedVariables(self, use_resource):
     var_full_shape = [10, 3]
     # Allows save/restore mechanism to work w/ different slicings.
     var_name = "my_var"
-    saved_path = os.path.join(_TestDir("partitioned_variables"), "ckpt")
+    saved_dir = self._get_test_dir("partitioned_variables")
+    saved_path = os.path.join(saved_dir, "ckpt")
+
     call_saver_with_dict = False  # updated by test loop below
 
     def _save(slices=None, partitioner=None):
@@ -704,6 +724,9 @@ class SaveRestoreShardedTest(test.TestCase):
 
         if slices:
           assert not partitioner
+          # TODO(apassos): make create_partitioned_variables take use_resource
+          # option to make this test passable without creating a named
+          # variable_scope.
           vs = partitioned_variables.create_partitioned_variables(
               var_full_shape, slices, rnd, name=var_name)
         elif partitioner:
@@ -712,10 +735,14 @@ class SaveRestoreShardedTest(test.TestCase):
                   var_name,
                   shape=var_full_shape,
                   initializer=rnd,
-                  partitioner=partitioner)
+                  partitioner=partitioner,
+                  use_resource=use_resource)
           ]
         else:
-          vs = [variables.Variable(rnd, name=var_name)]
+          if use_resource:
+            vs = [resource_variable_ops.ResourceVariable(rnd, name=var_name)]
+          else:
+            vs = [variables.Variable(rnd, name=var_name)]
 
         variables.global_variables_initializer().run()
         if call_saver_with_dict:
@@ -764,9 +791,9 @@ class SaveRestoreShardedTest(test.TestCase):
         if partitioner:
           return new_vs[0].as_tensor().eval()
         elif slices and slices[0] != 1:
-          return array_ops.concat_v2(new_vs, 0).eval()
+          return array_ops.concat(new_vs, 0).eval()
         elif slices and slices[1] != 1:
-          return array_ops.concat_v2(new_vs, 1).eval()
+          return array_ops.concat(new_vs, 1).eval()
         else:  # Non-sliced.
           return new_vs[0].eval()
 
@@ -801,11 +828,22 @@ class SaveRestoreShardedTest(test.TestCase):
       restored_full = _restore(slices=[1, 3])
       self.assertAllEqual(saved_full, restored_full)
 
+  def testPartitionedVariable(self):
+    self._testPartitionedVariables(use_resource=False)
+
+  def testPartitionedResourceVariable(self):
+    self._testPartitionedVariables(use_resource=True)
+
 
 class MaxToKeepTest(test.TestCase):
 
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
+
   def testNonSharded(self):
-    save_dir = _TestDir("max_to_keep_non_sharded")
+    save_dir = self._get_test_dir("max_to_keep_non_sharded")
 
     with self.test_session() as sess:
       v = variables.Variable(10.0, name="v")
@@ -925,7 +963,7 @@ class MaxToKeepTest(test.TestCase):
           saver_module.checkpoint_exists(save._MetaGraphFilename(s1)))
 
   def testSharded(self):
-    save_dir = _TestDir("max_to_keep_sharded")
+    save_dir = self._get_test_dir("max_to_keep_sharded")
 
     with session.Session(
         target="",
@@ -980,8 +1018,8 @@ class MaxToKeepTest(test.TestCase):
       self.assertTrue(gfile.Exists(save._MetaGraphFilename(s3)))
 
   def testNoMaxToKeep(self):
-    save_dir = _TestDir("no_max_to_keep")
-    save_dir2 = _TestDir("max_to_keep_0")
+    save_dir = self._get_test_dir("no_max_to_keep")
+    save_dir2 = self._get_test_dir("max_to_keep_0")
 
     with self.test_session() as sess:
       v = variables.Variable(10.0, name="v")
@@ -1008,7 +1046,7 @@ class MaxToKeepTest(test.TestCase):
       self.assertTrue(saver_module.checkpoint_exists(s2))
 
   def testNoMetaGraph(self):
-    save_dir = _TestDir("no_meta_graph")
+    save_dir = self._get_test_dir("no_meta_graph")
 
     with self.test_session() as sess:
       v = variables.Variable(10.0, name="v")
@@ -1022,8 +1060,13 @@ class MaxToKeepTest(test.TestCase):
 
 class KeepCheckpointEveryNHoursTest(test.TestCase):
 
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
+
   def testNonSharded(self):
-    save_dir = _TestDir("keep_checkpoint_every_n_hours")
+    save_dir = self._get_test_dir("keep_checkpoint_every_n_hours")
 
     with self.test_session() as sess:
       v = variables.Variable([10.0], name="v")
@@ -1239,8 +1282,13 @@ class LatestCheckpointWithRelativePaths(test.TestCase):
 
 class CheckpointStateTest(test.TestCase):
 
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
+
   def testAbsPath(self):
-    save_dir = _TestDir("abs_paths")
+    save_dir = self._get_test_dir("abs_paths")
     abs_path = os.path.join(save_dir, "model-0")
     ckpt = saver_module.generate_checkpoint_state_proto(save_dir, abs_path)
     self.assertEqual(ckpt.model_checkpoint_path, abs_path)
@@ -1259,7 +1307,7 @@ class CheckpointStateTest(test.TestCase):
     self.assertEqual(ckpt.all_model_checkpoint_paths[-1], new_rel_path)
 
   def testAllModelCheckpointPaths(self):
-    save_dir = _TestDir("all_models_test")
+    save_dir = self._get_test_dir("all_models_test")
     abs_path = os.path.join(save_dir, "model-0")
     for paths in [None, [], ["model-2"]]:
       ckpt = saver_module.generate_checkpoint_state_proto(
@@ -1271,7 +1319,7 @@ class CheckpointStateTest(test.TestCase):
       self.assertEqual(ckpt.all_model_checkpoint_paths[-1], abs_path)
 
   def testUpdateCheckpointState(self):
-    save_dir = _TestDir("update_checkpoint_state")
+    save_dir = self._get_test_dir("update_checkpoint_state")
     os.chdir(save_dir)
     # Make a temporary train directory.
     train_dir = "train"
@@ -1287,7 +1335,7 @@ class CheckpointStateTest(test.TestCase):
     self.assertEqual(ckpt.all_model_checkpoint_paths[0], abs_path)
 
   def testCheckPointStateFailsWhenIncomplete(self):
-    save_dir = _TestDir("checkpoint_state_fails_when_incomplete")
+    save_dir = self._get_test_dir("checkpoint_state_fails_when_incomplete")
     os.chdir(save_dir)
     ckpt_path = os.path.join(save_dir, "checkpoint")
     ckpt_file = open(ckpt_path, "w")
@@ -1297,7 +1345,7 @@ class CheckpointStateTest(test.TestCase):
       saver_module.get_checkpoint_state(save_dir)
 
   def testCheckPointCompletesRelativePaths(self):
-    save_dir = _TestDir("checkpoint_completes_relative_paths")
+    save_dir = self._get_test_dir("checkpoint_completes_relative_paths")
     os.chdir(save_dir)
     ckpt_path = os.path.join(save_dir, "checkpoint")
     ckpt_file = open(ckpt_path, "w")
@@ -1318,8 +1366,13 @@ class CheckpointStateTest(test.TestCase):
 
 class MetaGraphTest(test.TestCase):
 
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
+
   def testAddCollectionDef(self):
-    test_dir = _TestDir("good_collection")
+    test_dir = self._get_test_dir("good_collection")
     filename = os.path.join(test_dir, "metafile")
     with self.test_session():
       # Creates a graph.
@@ -1394,8 +1447,7 @@ class MetaGraphTest(test.TestCase):
       save._add_collection_def(meta_graph_def, "int_collection")
       self.assertEqual(len(meta_graph_def.collection_def), 0)
 
-  def _testMultiSaverCollectionSave(self):
-    test_dir = _TestDir("saver_collection")
+  def _testMultiSaverCollectionSave(self, test_dir):
     filename = os.path.join(test_dir, "metafile")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     saver1_ckpt = os.path.join(test_dir, "saver1.ckpt")
@@ -1439,8 +1491,7 @@ class MetaGraphTest(test.TestCase):
       savers = getattr(collection_def, kind)
       self.assertEqual(2, len(savers.value))
 
-  def _testMultiSaverCollectionRestore(self):
-    test_dir = os.path.join(self.get_temp_dir(), "saver_collection")
+  def _testMultiSaverCollectionRestore(self, test_dir):
     filename = os.path.join(test_dir, "metafile")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     saver1_ckpt = os.path.join(test_dir, "saver1.ckpt")
@@ -1468,11 +1519,12 @@ class MetaGraphTest(test.TestCase):
       self.assertEqual(11.0, v1.eval())
 
   def testMultiSaverCollection(self):
-    self._testMultiSaverCollectionSave()
-    self._testMultiSaverCollectionRestore()
+    test_dir = self._get_test_dir("saver_collection")
+    self._testMultiSaverCollectionSave(test_dir)
+    self._testMultiSaverCollectionRestore(test_dir)
 
   def testBinaryAndTextFormat(self):
-    test_dir = _TestDir("binary_and_text")
+    test_dir = self._get_test_dir("binary_and_text")
     filename = os.path.join(test_dir, "metafile")
     with self.test_session(graph=ops_lib.Graph()):
       # Creates a graph.
@@ -1504,7 +1556,7 @@ class MetaGraphTest(test.TestCase):
         saver_module.import_meta_graph(filename)
 
   def testSliceVariable(self):
-    test_dir = _TestDir("slice_saver")
+    test_dir = self._get_test_dir("slice_saver")
     filename = os.path.join(test_dir, "metafile")
     with self.test_session():
       v1 = variables.Variable([20.0], name="v1")
@@ -1527,8 +1579,7 @@ class MetaGraphTest(test.TestCase):
       # It should be the same as the original.
       self.assertProtoEquals(meta_graph_def, new_meta_graph_def)
 
-  def _testGraphExtensionSave(self):
-    test_dir = _TestDir("graph_extension")
+  def _testGraphExtensionSave(self, test_dir):
     filename = os.path.join(test_dir, "metafile")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     # Creates an inference graph.
@@ -1593,8 +1644,7 @@ class MetaGraphTest(test.TestCase):
       # Generates MetaGraphDef.
       saver0.export_meta_graph(filename)
 
-  def _testGraphExtensionRestore(self):
-    test_dir = os.path.join(self.get_temp_dir(), "graph_extension")
+  def _testGraphExtensionRestore(self, test_dir):
     filename = os.path.join(test_dir, "metafile")
     train_filename = os.path.join(test_dir, "train_metafile")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
@@ -1610,12 +1660,12 @@ class MetaGraphTest(test.TestCase):
       batch_size = array_ops.size(labels)
       labels = array_ops.expand_dims(labels, 1)
       indices = array_ops.expand_dims(math_ops.range(0, batch_size), 1)
-      concated = array_ops.concat_v2([indices, labels], 1)
+      concated = array_ops.concat([indices, labels], 1)
       onehot_labels = sparse_ops.sparse_to_dense(
           concated, array_ops.stack([batch_size, 10]), 1.0, 0.0)
       logits = ops_lib.get_collection("logits")[0]
       cross_entropy = nn_ops.softmax_cross_entropy_with_logits(
-          logits, onehot_labels, name="xentropy")
+          labels=onehot_labels, logits=logits, name="xentropy")
       loss = math_ops.reduce_mean(cross_entropy, name="xentropy_mean")
 
       summary.scalar("loss", loss)
@@ -1632,8 +1682,7 @@ class MetaGraphTest(test.TestCase):
       # Generates MetaGraphDef.
       saver_module.export_meta_graph(train_filename)
 
-  def _testRestoreFromTrainGraphWithControlContext(self):
-    test_dir = os.path.join(self.get_temp_dir(), "graph_extension")
+  def _testRestoreFromTrainGraphWithControlContext(self, test_dir):
     train_filename = os.path.join(test_dir, "train_metafile")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     with self.test_session(graph=ops_lib.Graph()) as sess:
@@ -1645,9 +1694,10 @@ class MetaGraphTest(test.TestCase):
       sess.run(train_op)
 
   def testGraphExtension(self):
-    self._testGraphExtensionSave()
-    self._testGraphExtensionRestore()
-    self._testRestoreFromTrainGraphWithControlContext()
+    test_dir = self._get_test_dir("graph_extension")
+    self._testGraphExtensionSave(test_dir)
+    self._testGraphExtensionRestore(test_dir)
+    self._testRestoreFromTrainGraphWithControlContext(test_dir)
 
   def testStrippedOpListDef(self):
     with self.test_session():
@@ -1687,7 +1737,7 @@ class MetaGraphTest(test.TestCase):
 
   def testImportIntoNamescope(self):
     # Test that we can import a meta graph into a namescope.
-    test_dir = _TestDir("import_into_namescope")
+    test_dir = self._get_test_dir("import_into_namescope")
     filename = os.path.join(test_dir, "ckpt")
     image = array_ops.placeholder(dtypes.float32, [None, 784])
     label = array_ops.placeholder(dtypes.float32, [None, 10])
@@ -1699,7 +1749,8 @@ class MetaGraphTest(test.TestCase):
       bias = variables.Variable(array_ops.zeros([10]), name="bias")
       logit = nn_ops.relu(math_ops.matmul(image, weights) + bias, name="logits")
       nn_ops.softmax(logit, name="prediction")
-      cost = nn_ops.softmax_cross_entropy_with_logits(logit, label, name="cost")
+      cost = nn_ops.softmax_cross_entropy_with_logits(labels=label,
+                                                      logits=logit, name="cost")
       adam.AdamOptimizer().minimize(cost, name="optimize")
       saver = saver_module.Saver()
       sess.run(variables.global_variables_initializer())
@@ -1727,7 +1778,8 @@ class MetaGraphTest(test.TestCase):
         bias = variables.Variable(array_ops.zeros([10]), name="bias")
         logit = nn_ops.relu(math_ops.matmul(image, weights) + bias)
         nn_ops.softmax(logit, name="prediction")
-        cost = nn_ops.softmax_cross_entropy_with_logits(logit, label)
+        cost = nn_ops.softmax_cross_entropy_with_logits(labels=label,
+                                                        logits=logit)
         adam.AdamOptimizer().minimize(cost, name="optimize")
       meta_graph_def = saver_module.export_meta_graph()
 
@@ -1759,7 +1811,8 @@ class MetaGraphTest(test.TestCase):
         bias = variables.Variable(array_ops.zeros([10]), name="bias")
         logit = nn_ops.relu(math_ops.matmul(image, weights) + bias)
         nn_ops.softmax(logit, name="prediction")
-        cost = nn_ops.softmax_cross_entropy_with_logits(logit, label)
+        cost = nn_ops.softmax_cross_entropy_with_logits(labels=label,
+                                                        logits=logit)
         adam.AdamOptimizer().minimize(cost, name="optimize")
       meta_graph_def = saver_module.export_meta_graph(clear_devices=True)
       graph_io.write_graph(meta_graph_def, "/tmp", "meta_graph.pbtxt")
@@ -1832,17 +1885,30 @@ class CheckpointReaderForV2Test(CheckpointReaderTest):
 
 class WriteGraphTest(test.TestCase):
 
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
+
   def testWriteGraph(self):
-    test_dir = _TestDir("write_graph_dir")
+    test_dir = self._get_test_dir("write_graph_dir")
     variables.Variable([[1, 2, 3], [4, 5, 6]], dtype=dtypes.float32, name="v0")
-    graph_io.write_graph(ops_lib.get_default_graph(),
-                         "/".join([test_dir, "l1"]), "graph.pbtxt")
+    path = graph_io.write_graph(ops_lib.get_default_graph(),
+                                os.path.join(test_dir, "l1"), "graph.pbtxt")
+    truth = os.path.join(test_dir, "l1", "graph.pbtxt")
+    self.assertEqual(path, truth)
+    self.assertTrue(os.path.exists(path))
+
 
   def testRecursiveCreate(self):
-    test_dir = _TestDir("deep_dir")
+    test_dir = self._get_test_dir("deep_dir")
     variables.Variable([[1, 2, 3], [4, 5, 6]], dtype=dtypes.float32, name="v0")
-    graph_io.write_graph(ops_lib.get_default_graph().as_graph_def(),
-                         "/".join([test_dir, "l1/l2/l3"]), "graph.pbtxt")
+    path = graph_io.write_graph(ops_lib.get_default_graph().as_graph_def(),
+                                os.path.join(test_dir, "l1", "l2", "l3"),
+                                "graph.pbtxt")
+    truth = os.path.join(test_dir, 'l1', 'l2', 'l3', "graph.pbtxt")
+    self.assertEqual(path, truth)
+    self.assertTrue(os.path.exists(path))
 
 
 class SaverUtilsTest(test.TestCase):
@@ -1888,6 +1954,11 @@ class SaverUtilsTest(test.TestCase):
 
 
 class ScopedGraphTest(test.TestCase):
+
+  def _get_test_dir(self, dirname):
+    test_dir = os.path.join(self.get_temp_dir(), dirname)
+    gfile.MakeDirs(test_dir)
+    return test_dir
 
   def _testScopedSave(self, test_dir, exported_filename, ckpt_filename):
     graph = ops_lib.Graph()
@@ -2021,7 +2092,7 @@ class ScopedGraphTest(test.TestCase):
   # Verifies that we can save the subgraph under "hidden1" and restore it
   # into "new_hidden1" in the new graph.
   def testScopedSaveAndRestore(self):
-    test_dir = _TestDir("scoped_export_import")
+    test_dir = self._get_test_dir("scoped_export_import")
     ckpt_filename = "ckpt"
     self._testScopedSave(test_dir, "exported_hidden1.pbtxt", ckpt_filename)
     self._testScopedRestore(test_dir, "exported_hidden1.pbtxt",
@@ -2030,7 +2101,7 @@ class ScopedGraphTest(test.TestCase):
   # Verifies that we can copy the subgraph under "hidden1" and copy it
   # to different name scope in the same graph or different graph.
   def testCopyScopedGraph(self):
-    test_dir = _TestDir("scoped_copy")
+    test_dir = self._get_test_dir("scoped_copy")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     graph1 = ops_lib.Graph()
     with graph1.as_default():
@@ -2086,7 +2157,7 @@ class ScopedGraphTest(test.TestCase):
       self.assertAllClose(expected, sess.run("new_hidden1/relu:0"))
 
   def testExportGraphDefWithScope(self):
-    test_dir = _TestDir("export_graph_def")
+    test_dir = self._get_test_dir("export_graph_def")
     saver0_ckpt = os.path.join(test_dir, "saver0.ckpt")
     graph1 = ops_lib.Graph()
     with graph1.as_default():
